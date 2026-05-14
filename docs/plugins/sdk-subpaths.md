@@ -361,9 +361,11 @@ focused channel/runtime subpaths, `config-contracts`, `string-coerce-runtime`,
   </Accordion>
 
   <Accordion title="Reserved bundled-helper subpaths">
-    There are currently no reserved bundled-helper SDK subpaths. Owner-specific
-    helpers live inside the owning plugin package, while reusable host contracts
-    use generic SDK subpaths such as `plugin-sdk/gateway-runtime`,
+    Reserved bundled-helper subpaths such as `plugin-sdk/codex-mcp-projection`
+    and `plugin-sdk/codex-native-task-runtime` are transitional compatibility
+    seams for their owning bundled plugins. New owner-specific helpers should
+    live inside the owning plugin package, while reusable host contracts use
+    generic SDK subpaths such as `plugin-sdk/gateway-runtime`,
     `plugin-sdk/security-runtime`, and `plugin-sdk/plugin-config-runtime`.
   </Accordion>
 </AccordionGroup>
