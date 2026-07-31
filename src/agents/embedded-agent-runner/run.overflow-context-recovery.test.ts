@@ -52,6 +52,7 @@ vi.mock("./provider-prompt-state.js", () => ({
 }));
 
 vi.mock("./tool-result-truncation.js", () => ({
+  resolveLiveToolResultAggregateMaxChars: () => 128_000,
   resolveLiveToolResultMaxChars: () => 32_000,
   sessionLikelyHasOversizedToolResults: mocks.sessionLikelyHasOversizedToolResults,
   truncateOversizedToolResultsInSessionManager: mocks.truncateOversizedToolResults,
@@ -385,6 +386,63 @@ describe("recoverEmbeddedRunOverflow", () => {
 
     expect(result).toMatchObject({ action: "surface", kind: "context_overflow" });
     expect(mocks.warn).toHaveBeenCalledWith(expect.stringContaining("auto-compaction failed"));
+  });
+
+  it("truncates tool results before generic overflow compaction", async () => {
+    mocks.sessionLikelyHasOversizedToolResults.mockReturnValueOnce(true);
+    mocks.truncateOversizedToolResults.mockReturnValueOnce({
+      truncated: true,
+      truncatedCount: 2,
+    });
+    const input = makeInput();
+
+    const result = await recoverEmbeddedRunOverflow(input);
+
+    expect(result).toEqual({ action: "retry" });
+    expect(input.state.toolResultTruncationAttempted).toBe(true);
+    expect(input.state.overflowCompactionAttempts).toBe(0);
+    expect(mocks.compact).not.toHaveBeenCalled();
+    expect(input.markOwnedTranscriptRetry).toHaveBeenCalledOnce();
+    expect(input.prepareCompactedTranscriptRetry).toHaveBeenCalledWith(input.assertRecoveryActive);
+    expect(mocks.sessionLikelyHasOversizedToolResults).toHaveBeenCalledWith(
+      expect.objectContaining({
+        maxCharsOverride: 16_000,
+        aggregateMaxCharsOverride: 64_000,
+      }),
+    );
+    expect(mocks.truncateOversizedToolResults).toHaveBeenCalledWith(
+      expect.objectContaining({
+        maxCharsOverride: 16_000,
+        aggregateMaxCharsOverride: 64_000,
+      }),
+    );
+    expect(mocks.info).toHaveBeenCalledWith(
+      expect.stringContaining("retrying prompt before compaction"),
+    );
+  });
+
+  it("falls through to compaction when pre-compaction truncation is a no-op", async () => {
+    mocks.sessionLikelyHasOversizedToolResults.mockReturnValueOnce(true);
+    mocks.truncateOversizedToolResults.mockReturnValueOnce({
+      truncated: false,
+      truncatedCount: 0,
+      reason: "nothing to truncate",
+    });
+    const input = makeInput();
+
+    const result = await recoverEmbeddedRunOverflow(input);
+
+    expect(result).toEqual({ action: "retry" });
+    expect(input.state.toolResultTruncationAttempted).toBe(true);
+    expect(input.state.overflowCompactionAttempts).toBe(1);
+    expect(mocks.truncateOversizedToolResults).toHaveBeenCalledOnce();
+    expect(mocks.compact).toHaveBeenCalledOnce();
+    expect(mocks.truncateOversizedToolResults.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.compact.mock.invocationCallOrder[0]!,
+    );
+    expect(mocks.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Pre-compaction tool result truncation did not help"),
+    );
   });
 
   it.each([
