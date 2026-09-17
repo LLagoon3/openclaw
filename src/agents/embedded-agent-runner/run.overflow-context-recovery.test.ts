@@ -494,7 +494,7 @@ describe("recoverEmbeddedRunOverflow", () => {
       compacted: false,
       reason: "nothing to compact",
     });
-    mocks.sessionLikelyHasOversizedToolResults.mockReturnValueOnce(true);
+    mocks.sessionLikelyHasOversizedToolResults.mockReturnValueOnce(false).mockReturnValueOnce(true);
     mocks.truncateOversizedToolResults.mockReturnValueOnce({
       truncated: true,
       truncatedCount: 1,
@@ -510,11 +510,23 @@ describe("recoverEmbeddedRunOverflow", () => {
     const result = await recoverEmbeddedRunOverflow(input);
 
     expect(result).toEqual({ action: "retry" });
+    expect(mocks.compact).toHaveBeenCalledOnce();
+    expect(mocks.sessionLikelyHasOversizedToolResults).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        maxCharsOverride: 16_000,
+        aggregateMaxCharsOverride: 64_000,
+      }),
+    );
     expect(mocks.truncateOversizedToolResults).toHaveBeenCalledWith(
       expect.objectContaining({
         projectionState,
         sessionManager: expect.any(SessionManager),
+        maxCharsOverride: 16_000,
+        aggregateMaxCharsOverride: 64_000,
       }),
+    );
+    expect(mocks.compact.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.truncateOversizedToolResults.mock.invocationCallOrder[0]!,
     );
   });
 
@@ -529,7 +541,7 @@ describe("recoverEmbeddedRunOverflow", () => {
       compacted: false,
       reason: "nothing to compact",
     });
-    mocks.sessionLikelyHasOversizedToolResults.mockReturnValueOnce(true);
+    mocks.sessionLikelyHasOversizedToolResults.mockReturnValueOnce(false).mockReturnValueOnce(true);
     mocks.truncateOversizedToolResults.mockReturnValueOnce({
       truncated: true,
       truncatedCount: 2,
@@ -546,8 +558,15 @@ describe("recoverEmbeddedRunOverflow", () => {
     );
 
     expect(result).toEqual({ action: "retry" });
+    expect(mocks.compact).toHaveBeenCalledOnce();
     expect(mocks.sessionLikelyHasOversizedToolResults).toHaveBeenCalledWith(
       expect.objectContaining({ messages: messagesSnapshot }),
+    );
+    expect(mocks.sessionLikelyHasOversizedToolResults).toHaveBeenLastCalledWith(
+      expect.objectContaining({ messages: messagesSnapshot }),
+    );
+    expect(mocks.compact.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.truncateOversizedToolResults.mock.invocationCallOrder[0]!,
     );
     expect(mocks.info).toHaveBeenCalledWith(expect.stringContaining("Truncated 2 tool result(s)"));
   });

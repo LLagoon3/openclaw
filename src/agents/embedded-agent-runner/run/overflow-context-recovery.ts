@@ -176,11 +176,25 @@ export async function recoverEmbeddedRunOverflow(
   const preflightRecovery = input.attempt.preflightRecovery;
   const requiresTranscriptContinuation =
     preflightRecovery?.source === "mid-turn" || !isCurrentAttemptReplaySafe(input.attempt);
+  const liveToolResultMaxChars = resolveLiveToolResultMaxChars({
+    contextWindowTokens: contextTokenBudget,
+  });
+  const liveToolResultBudgets = {
+    maxChars: liveToolResultMaxChars,
+    aggregateMaxChars: resolveLiveToolResultAggregateMaxChars({
+      contextWindowTokens: contextTokenBudget,
+      perResultMaxChars: liveToolResultMaxChars,
+    }),
+  };
   const recoveryToolResultBudgets = resolveOverflowRecoveryToolResultBudgets({
     contextTokenBudget,
     observedOverflowTokens,
   });
-  const truncateToolResults = async () => {
+  const truncateToolResults = async (
+    budgets: typeof liveToolResultBudgets = isPreflightRecovery
+      ? liveToolResultBudgets
+      : recoveryToolResultBudgets,
+  ) => {
     const { sessionManager, assertActive } = input.prepareRecoverySession(contextTokenBudget);
     if (!sessionManager) {
       return {
@@ -195,8 +209,8 @@ export async function recoverEmbeddedRunOverflow(
       const result = truncateOversizedToolResultsInSessionManager({
         sessionManager,
         contextWindowTokens: contextTokenBudget,
-        maxCharsOverride: recoveryToolResultBudgets.maxChars,
-        aggregateMaxCharsOverride: recoveryToolResultBudgets.aggregateMaxChars,
+        maxCharsOverride: budgets.maxChars,
+        aggregateMaxCharsOverride: budgets.aggregateMaxChars,
         protectTrailingToolResults: preflightRecovery?.route === "compact_then_truncate",
         projectionState: getEmbeddedSessionPromptState(input.getActiveSession().id).toolResults,
         ...target,
@@ -239,7 +253,12 @@ export async function recoverEmbeddedRunOverflow(
 
   const isCompactionFailure = isCompactionFailureError(errorText);
 
-  const attemptToolResultTruncation = async (phase: "before compaction" | "fallback") => {
+  const attemptToolResultTruncation = async (
+    phase: "before compaction" | "fallback",
+    budgets: typeof liveToolResultBudgets = isPreflightRecovery
+      ? liveToolResultBudgets
+      : recoveryToolResultBudgets,
+  ) => {
     if (input.state.toolResultTruncationAttempted) {
       return undefined;
     }
@@ -247,8 +266,8 @@ export async function recoverEmbeddedRunOverflow(
       ? sessionLikelyHasOversizedToolResults({
           messages: input.attempt.messagesSnapshot,
           contextWindowTokens: contextTokenBudget,
-          maxCharsOverride: recoveryToolResultBudgets.maxChars,
-          aggregateMaxCharsOverride: recoveryToolResultBudgets.aggregateMaxChars,
+          maxCharsOverride: budgets.maxChars,
+          aggregateMaxCharsOverride: budgets.aggregateMaxChars,
         })
       : false;
     if (!hasToolResultPressure) {
@@ -260,7 +279,7 @@ export async function recoverEmbeddedRunOverflow(
       `[context-overflow-recovery] Attempting tool result truncation ${phase} for ${input.modelSelection.provider}/${input.modelSelection.model} ` +
         `(contextWindow=${contextTokenBudget} tokens)`,
     );
-    return await truncateToolResults();
+    return await truncateToolResults(budgets);
   };
 
   // Compaction here budgets against the model's context window, so it cannot make the request fit
