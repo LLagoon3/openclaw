@@ -136,7 +136,7 @@ export function buildMemoryPromptSection({
         "Session search line numbers are not history offsets. Never read raw transcript files to expand session hits.",
       ];
   const outcomeGuidance =
-    "Report recall as partial, unavailable, or stale when the result includes a top-level warning or action guidance, or explicitly sets disabled=true or stale=true. Do not treat an optional corpus outcome of not-registered as unavailable.";
+    "Report recall as partial, unavailable, or stale when the result includes a top-level warning or action guidance, or explicitly sets disabled=true or stale=true. In a multi-corpus result without a top-level warning or action guidance, treat an optional corpus outcome of not-registered as informational.";
   const citationGuidance =
     citationsMode === "off"
       ? "Citations are disabled: do not mention file paths or line numbers in replies unless the user explicitly asks."

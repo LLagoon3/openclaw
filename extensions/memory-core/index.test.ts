@@ -159,7 +159,7 @@ describe("buildPromptSection", () => {
     expect(result[1]).not.toContain("then use memory_get");
   });
 
-  it("keeps an unregistered optional corpus informational", () => {
+  it("limits informational unregistered guidance to combined results without warnings", () => {
     const prompt = buildMemoryPromptSection({
       availableTools: new Set(["memory_search"]),
     }).join("\n");
@@ -168,7 +168,7 @@ describe("buildPromptSection", () => {
     expect(prompt).toContain("Use corpus=all only when compiled wiki supplements are needed");
     expect(prompt).toContain("top-level warning or action guidance");
     expect(prompt).toContain(
-      "Do not treat an optional corpus outcome of not-registered as unavailable",
+      "In a multi-corpus result without a top-level warning or action guidance, treat an optional corpus outcome of not-registered as informational",
     );
   });
 
