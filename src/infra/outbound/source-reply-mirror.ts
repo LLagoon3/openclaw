@@ -79,24 +79,12 @@ type TerminalSourceReplyDeliveryReceipt = RestartRecoveryTerminalDeliveryScope;
 
 type SourceReplyThreadPlacement = "match" | "mismatch" | "unknown";
 
-// Mirror only enough delivered payload detail to preserve transcript context.
-function readStringArray(value: unknown): string[] | undefined {
-  return normalizeOptionalTrimmedStringList(value);
-}
-
-function readFirstString(
-  params: Record<string, unknown>,
-  keys: readonly string[],
-): string | undefined {
-  return readTrimmedStringAlias(params, keys);
-}
-
 function resolveSourceReplyTarget(params: Record<string, unknown>): string | undefined {
-  return readFirstString(params, ["target", "to", "channelId", "chatId"]);
+  return readTrimmedStringAlias(params, ["target", "to", "channelId", "chatId"]);
 }
 
 function resolveSourceReplyThreadId(params: SourceReplyTranscriptMirrorParams): string | undefined {
-  return readFirstString(params.actionParams, ["threadId", "messageThreadId"]);
+  return readTrimmedStringAlias(params.actionParams, ["threadId", "messageThreadId"]);
 }
 
 function resolveDeliveryReceipt(
@@ -264,7 +252,10 @@ export async function reconcileTerminalSourceReplyDelivery(params: {
     return "not-delivered";
   }
   if (
-    !matchesDeliveredSourceTargets(params.mirror, deliveryFact) ||
+    !matchesDeliveredSourceTargets(
+      { ...params.mirror, deliveredPayload: params.deliveredPayload },
+      deliveryFact,
+    ) ||
     !isExactCurrentSourceConversation({
       ...params.mirror,
       deliveredPayload: params.deliveredPayload,
@@ -370,8 +361,30 @@ function matchesDeliveredSourceTargets(
 ): boolean {
   // Requested routes cannot override contradictory transport facts. Match each
   // reported recipient independently, without inheriting requested thread aliases.
+  // Aggregate metadata cannot hide a physical message delivered to another topic.
+  const receipt = resolveDeliveryReceipt(params);
+  const deliveredThreadId = normalizeOptionalString(receipt?.threadId);
+  const currentThreadId = normalizeOptionalString(params.toolContext?.currentThreadTs);
+  if (
+    Array.isArray(receipt?.parts) &&
+    receipt.parts.some((part) => {
+      const threadId = normalizeOptionalString(asRecord(part)?.threadId);
+      return threadId !== undefined && threadId !== (deliveredThreadId ?? currentThreadId);
+    })
+  ) {
+    return false;
+  }
   return (delivery?.deliveredTargets ?? []).every((target) =>
-    matchesCurrentSourceTarget({ ...params, actionParams: { target } }, "match"),
+    matchesCurrentSourceTarget(
+      {
+        ...params,
+        actionParams: {
+          target,
+          ...(deliveredThreadId ? { threadId: deliveredThreadId } : {}),
+        },
+      },
+      "match",
+    ),
   );
 }
 
@@ -591,15 +604,17 @@ export async function mirrorDeliveredSourceReplyToTranscript(
 
   const plan = createOutboundPayloadPlan([
     {
-      text: readFirstString(params.actionParams, ["message", "content", "text", "caption"]) ?? "",
-      mediaUrl: readFirstString(params.actionParams, [
+      text:
+        readTrimmedStringAlias(params.actionParams, ["message", "content", "text", "caption"]) ??
+        "",
+      mediaUrl: readTrimmedStringAlias(params.actionParams, [
         "mediaUrl",
         "media",
         "path",
         "filePath",
         "fileUrl",
       ]),
-      mediaUrls: readStringArray(params.actionParams.mediaUrls),
+      mediaUrls: normalizeOptionalTrimmedStringList(params.actionParams.mediaUrls),
       presentation: params.actionParams.presentation as ReplyPayload["presentation"],
       interactive: params.actionParams.interactive as ReplyPayload["interactive"],
       channelData: params.actionParams.channelData as ReplyPayload["channelData"],
@@ -639,8 +654,5 @@ export async function mirrorDeliveredSourceReplyToTranscript(
       : {}),
     config: params.cfg,
   });
-  if (result.ok) {
-    return true;
-  }
-  return false;
+  return result.ok;
 }
