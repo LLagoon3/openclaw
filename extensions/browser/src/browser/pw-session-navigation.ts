@@ -389,6 +389,7 @@ export async function gotoPageWithNavigationGuard(
     url: string;
     timeoutMs: number;
     targetId?: string;
+    signal?: AbortSignal;
     assertPageCurrent?: () => void | Promise<void>;
   } & BrowserNavigationPolicyOptions,
 ): Promise<Response | null> {
@@ -411,8 +412,13 @@ export async function gotoPageWithNavigationGuard(
       await assertBrowserNavigationAllowed({
         url: request.url(),
         ...navigationPolicy,
+        ...(opts.signal ? { signal: opts.signal } : {}),
       });
     } catch (err) {
+      if (opts.signal?.aborted) {
+        await route.abort().catch(() => {});
+        return;
+      }
       if (isPolicyDenyNavigationError(err)) {
         if (requestKind === "top-level") {
           blockedError = err;
