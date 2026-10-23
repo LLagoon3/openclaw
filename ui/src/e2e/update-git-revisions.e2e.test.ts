@@ -1,7 +1,5 @@
-import path from "node:path";
 import { expect, it } from "vitest";
 import type { UpdateScheduleState } from "../api/types.ts";
-import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
 import { installMockGateway, waitForControlUiRoute } from "../test-helpers/control-ui-e2e.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 
@@ -15,7 +13,6 @@ suite.define(() => {
   it.each([1280, 420])(
     "shows the Git revision range before updating at width %s",
     async (width) => {
-      const proofDir = createControlUiE2eArtifactDir("update-git-revisions");
       await suite.withPage(
         {
           colorScheme: "dark",
@@ -48,26 +45,37 @@ suite.define(() => {
               commitsBehind: 3,
             },
           };
+          const refreshedGit = {
+            status: "behind" as const,
+            currentSha: updateAvailable.currentSha,
+            upstreamSha: "fedcba9876543210fedcba9876543210fedcba98",
+            repositoryUrl: updateAvailable.repositoryUrl,
+            commitsBehind: 5,
+          };
+          const refreshedSchedule = {
+            ...schedule,
+            install: { kind: "git" as const, git: refreshedGit },
+          };
           const gateway = await installMockGateway(page, {
             updateAvailable,
             updateSchedule: schedule,
             methodResponses: {
-              "update.status": { sentinel: null, schedule, updateAvailable },
+              "update.status": { sentinel: null, schedule: refreshedSchedule, updateAvailable },
             },
           });
           expect((await page.goto(`${suite.server.baseUrl}settings/updates`))?.status()).toBe(200);
           await waitForControlUiRoute(page, { pathname: "/settings/updates", routeId: "updates" });
-          await page.getByRole("button", { name: "Update now", exact: true }).click();
+          await page.locator(".settings-status", { hasText: "5 commits behind" }).waitFor();
+          const statusLink = page.locator(".updates-status-control .update-git-revisions a");
+          const compareUrl = `https://github.com/example/openclaw/compare/${refreshedGit.currentSha}...${refreshedGit.upstreamSha}`;
+          await expect.poll(() => statusLink.getAttribute("href")).toBe(compareUrl);
+          await page.getByRole("button", { name: "Update Gateway…", exact: true }).click();
           await page.getByRole("dialog", { name: "Update Gateway", exact: true }).waitFor();
           const modal = page.locator("openclaw-modal-dialog");
-          await page.screenshot({
-            animations: "disabled",
-            path: path.join(proofDir, `confirmation-${width}.png`),
-          });
           const summary = modal.locator(".exec-approval-command > div").first();
           const range = modal.locator(".update-git-revisions__range");
-          expect(await summary.textContent()).toBe("Installed v2026.9.5 · 3 commits behind");
-          expect(await range.locator("code").allTextContents()).toEqual(["12345678", "abcdef12"]);
+          expect(await summary.textContent()).toBe("Installed v2026.9.5 · 5 commits behind");
+          expect(await range.locator("code").allTextContents()).toEqual(["12345678", "fedcba98"]);
           const summaryBox = await summary.boundingBox();
           const rangeBox = await range.boundingBox();
           expect(rangeBox?.y).toBeGreaterThan((summaryBox?.y ?? 0) + (summaryBox?.height ?? 0));
@@ -79,21 +87,19 @@ suite.define(() => {
             .evaluateAll((codes) => codes.map((code) => code.getBoundingClientRect().top));
           expect(codeBoxes[0]).toBe(codeBoxes[1]);
           const link = modal.getByRole("link", { name: "Compare on GitHub" });
-          expect(await link.getAttribute("href")).toBe(
-            `https://github.com/example/openclaw/compare/${updateAvailable.currentSha}...${updateAvailable.upstreamSha}`,
-          );
+          expect(await link.getAttribute("href")).toBe(compareUrl);
           expect(await link.getAttribute("target")).toBe("_blank");
           expect(await gateway.getRequests("update.run")).toHaveLength(0);
           await page.getByRole("button", { name: "Cancel", exact: true }).click();
           await modal.waitFor({ state: "detached" });
           expect(await page.locator(".settings-status").textContent()).toContain(
-            "3 commits behind",
+            "5 commits behind",
           );
           expect(
             await page
               .locator(".updates-status-control .update-git-revisions code")
               .allTextContents(),
-          ).toEqual(["12345678", "abcdef12"]);
+          ).toEqual(["12345678", "fedcba98"]);
         },
       );
     },

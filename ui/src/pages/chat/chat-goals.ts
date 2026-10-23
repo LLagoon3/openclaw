@@ -1,16 +1,16 @@
+import { GatewayProtocolRequestTimeoutError } from "@openclaw/gateway-client/browser";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { Value } from "typebox/value";
-import {
-  SessionsGoalClearParamsSchema,
-  SessionsGoalUpdateParamsSchema,
-  type SessionsGoalClearParams,
-  type SessionsGoalMutationResult,
-  type SessionsGoalUpdateParams,
+import type {
+  SessionsGoalClearParams,
+  SessionsGoalMutationResult,
+  SessionsGoalUpdateParams,
 } from "../../../../packages/gateway-protocol/src/schema/sessions-goal.js";
+import { createChangeListeners } from "../../../../src/shared/listeners.js";
 import { GatewayRequestError } from "../../api/gateway.ts";
-import type { GatewaySessionRow } from "../../api/types.ts";
+import type { SessionGoal } from "../../api/types.ts";
 import { t } from "../../i18n/index.ts";
 import { registerChatGoalsEnglish } from "../../i18n/locales/en-chat-goals.ts";
+import { registerChatSessionEnglish } from "../../i18n/locales/en-chat-session.ts";
 import type { ChatGoalAction, ChatGoalDraft, ChatGoalRecovery } from "../../lib/chat/chat-types.ts";
 import {
   goalOperationExpired,
@@ -18,18 +18,26 @@ import {
   goalOperationStorageGeneration,
 } from "../../lib/chat/goal-operation-storage.ts";
 import { formatUiError } from "../../lib/format-error.ts";
-import { scopedAgentIdForSession, visibleSessionMatches } from "../../lib/sessions/index.ts";
+import {
+  isSessionsGoalClearParams,
+  isSessionsGoalUpdateParams,
+} from "../../lib/protocol-validators.generated/session-input.js";
+import {
+  scopedAgentIdForSession,
+  scopedAgentListParamsForSession,
+  visibleSessionMatches,
+} from "../../lib/sessions/index.ts";
 import type { SessionRowObservation } from "../../lib/sessions/session-capability.ts";
 import {
   areUiSessionKeysEquivalent,
   resolveUiConversationIdentity,
 } from "../../lib/sessions/session-key.ts";
 import { generateUUID } from "../../lib/uuid.ts";
-import type { ChatHost } from "./chat-send-contract.ts";
-import { setChatError } from "./chat-send-queue-state.ts";
-import type { ChatSendSubmitOptions } from "./chat-send-submit.ts";
-import { refreshChatSessionListForTarget } from "./chat-session.ts";
+import { isInitialChatHistoryUnavailable, setChatError } from "./chat-history-state.ts";
+import type { ChatHost, ChatSendSubmitOptions } from "./chat-send-contract.ts";
 import { adoptStartedChatRun } from "./run-lifecycle.ts";
+
+registerChatSessionEnglish();
 
 registerChatGoalsEnglish();
 
@@ -48,16 +56,121 @@ type GoalOperation = {
   pending: boolean;
 };
 
-const goalOperations = new WeakMap<ChatHost, Map<string, GoalOperation>>();
+class GoalOperationOwner {
+  private readonly operations = new Map<string, GoalOperation>();
+  private readonly listeners = createChangeListeners();
+  private startedExecution?: {
+    goalId: string;
+    runId: string;
+    isCurrent: () => boolean;
+  };
+
+  recordStartedExecution(goalId: string, runId: string, isCurrent: () => boolean): void {
+    // Retain only the latest accepted receipt, not another run lifecycle or durable store.
+    this.startedExecution = { goalId, runId, isCurrent };
+    this.publish();
+  }
+
+  confirmedRunId(goalId: string, currentRunId: string | null | undefined): string | undefined {
+    const execution = this.startedExecution;
+    return execution?.goalId === goalId && execution.runId === currentRunId && execution.isCurrent()
+      ? execution.runId
+      : undefined;
+  }
+
+  readonly subscribe = this.listeners.subscribe;
+
+  get(signature: string): GoalOperation | undefined {
+    return this.operations.get(signature);
+  }
+
+  set(signature: string, operation: GoalOperation): void {
+    this.operations.set(signature, operation);
+    this.publish();
+  }
+
+  delete(signature: string): void {
+    if (this.operations.delete(signature)) {
+      this.publish();
+    }
+  }
+
+  setPending(operation: GoalOperation, pending: boolean): void {
+    operation.pending = pending;
+    this.publish();
+  }
+
+  expire(operation: GoalOperation): void {
+    operation.params = undefined;
+    operation.retired = "expired";
+    this.publish();
+  }
+
+  private readonly publish = this.listeners.publish;
+}
+
+const goalOperations = new WeakMap<ChatHost, GoalOperationOwner>();
+
+export function chatGoalOperations(host: ChatHost): GoalOperationOwner {
+  let owner = goalOperations.get(host);
+  if (!owner) {
+    owner = new GoalOperationOwner();
+    goalOperations.set(host, owner);
+  }
+  return owner;
+}
+
+type ChatGoalPresentation = {
+  value: SessionGoal;
+  executionConfirmed: boolean;
+  confirmedRunId?: string;
+};
+
+/** Receipt confirmation changes the label, never the presence of an existing Goal. */
+export function chatGoalPresentation(
+  host: ChatHost,
+  goal: SessionGoal | undefined,
+): ChatGoalPresentation | undefined {
+  if (!goal) {
+    return undefined;
+  }
+  const confirmedRunId =
+    goal.status === "active"
+      ? goalOperations.get(host)?.confirmedRunId(goal.id, host.chatRunId)
+      : undefined;
+  return { value: goal, executionConfirmed: confirmedRunId !== undefined, confirmedRunId };
+}
+
 const GOAL_REQUEST_TIMEOUT_MS = 30_000;
 const rejectedGoalReasons = new Set([
   "expired",
   "operation-conflict",
   "session-rebound",
+  "session-busy",
   "goal-rebound",
   "capacity",
   "invalid",
 ]);
+
+function rejectedGoalReason(error: unknown): string | undefined {
+  const details =
+    error instanceof GatewayRequestError && isRecord(error.details) ? error.details : null;
+  const reason = details?.reason;
+  if (
+    typeof reason === "string" &&
+    ((details?.code === "GOAL_OPERATION_REJECTED" && rejectedGoalReasons.has(reason)) ||
+      // Resume can be rejected by chat pre-admission before a turn is reserved.
+      (reason.startsWith("goal-") && rejectedGoalReasons.has(reason.slice(5))))
+  ) {
+    return reason;
+  }
+  return undefined;
+}
+
+function rejectGoalOperation(host: ChatHost, message: string): false {
+  setChatError(host, message);
+  return false;
+}
 
 function goalOperationTarget(host: ChatHost) {
   if (!host.client?.recoveryScopeReady || !host.client.recoveryScope) {
@@ -70,8 +183,7 @@ function goalOperationTarget(host: ChatHost) {
   const incognito = Boolean(host.selectedChatSessionIncognito);
   const storageKey = `${goalOperationScopePrefix(gatewayUrl, host.client.recoveryScope)}${JSON.stringify([sessionKey, agentId, sessionId, incognito])}`;
   const signature = `${goalOperationStorageGeneration(gatewayUrl)}:${storageKey}`;
-  const operations = goalOperations.get(host) ?? new Map<string, GoalOperation>();
-  goalOperations.set(host, operations);
+  const operations = chatGoalOperations(host);
   const storage = incognito ? undefined : globalThis.sessionStorage;
   if (!incognito && !storage) {
     throw new Error(t("chat.goals.recoveryUnavailable"));
@@ -86,23 +198,19 @@ function goalOperationTarget(host: ChatHost) {
       } catch {
         saved = "invalid";
       }
-      const schema =
+      const validate =
         isRecord(saved) && "action" in saved
-          ? SessionsGoalUpdateParamsSchema
-          : SessionsGoalClearParamsSchema;
+          ? isSessionsGoalUpdateParams
+          : isSessionsGoalClearParams;
       operation =
         saved === "expired"
           ? { retired: "expired", pending: false }
           : isRecord(saved) &&
-              Value.Check(schema, saved) &&
+              validate(saved) &&
               saved.sessionKey === sessionKey &&
               saved.agentId === agentId &&
               saved.sessionId === sessionId
-            ? {
-                // SAFETY: The exact action schema and session ownership fields were checked above.
-                params: saved as GoalParams,
-                pending: false,
-              }
+            ? { params: saved, pending: false }
             : { retired: "invalid", pending: false };
       if (operation.retired) {
         storage?.setItem(storageKey, JSON.stringify(operation.retired));
@@ -116,8 +224,7 @@ function goalOperationTarget(host: ChatHost) {
     operation.params &&
     goalOperationExpired(operation.params.issuedAtMs)
   ) {
-    operation.params = undefined;
-    operation.retired = "expired";
+    operations.expire(operation);
     storage?.setItem(storageKey, JSON.stringify("expired"));
   }
   return { sessionKey, agentId, sessionId, signature, storageKey, storage, operations, operation };
@@ -133,6 +240,12 @@ export function chatGoalRecovery(host: ChatHost): ChatGoalRecovery | undefined {
     }
     return {
       pending: operation.pending,
+      goalId: operation.params?.goalId,
+      action: operation.params
+        ? "action" in operation.params
+          ? operation.params.action
+          : "clear"
+        : undefined,
       retired: operation.retired,
       onCheck: () => runGoalOperation(host, undefined, operation),
     };
@@ -150,8 +263,7 @@ export async function submitChatGoalDraft(
     return false;
   }
   if (draft.sessionId && draft.sessionId !== host.currentSessionId) {
-    setChatError(host, t("chat.goals.sessionChanged"));
-    return false;
+    return rejectGoalOperation(host, t("chat.goals.sessionChanged"));
   }
   if (draft.action === "edit") {
     return mutateChatGoal(host, {
@@ -192,24 +304,25 @@ async function runGoalOperation(
 ): Promise<boolean> {
   const client = host.client;
   if (!client || !host.connected || !client.recoveryScopeReady) {
-    setChatError(host, t("chat.goals.offline"));
-    return false;
+    return rejectGoalOperation(host, t("chat.goals.offline"));
   }
   if (!client.recoveryScope) {
-    setChatError(host, t("chat.goals.recoveryUnavailable"));
-    return false;
+    return rejectGoalOperation(host, t("chat.goals.recoveryUnavailable"));
   }
   let target: ReturnType<typeof goalOperationTarget>;
   try {
     target = goalOperationTarget(host);
   } catch (error) {
-    setChatError(host, `${t("chat.goals.recoveryUnavailable")} ${formatUiError(error)}`);
-    return false;
+    return rejectGoalOperation(
+      host,
+      `${t("chat.goals.recoveryUnavailable")} ${formatUiError(error)}`,
+    );
   }
   if (!target) {
     return false;
   }
   const { sessionKey, agentId, sessionId, signature, storageKey, storage, operations } = target;
+  const rowAgentId = scopedAgentListParamsForSession(host, sessionKey).agentId;
   let { operation } = target;
   // A rendered recovery control owns its captured request, not a later foreground target.
   if (expectedOperation && operation !== expectedOperation) {
@@ -225,15 +338,9 @@ async function runGoalOperation(
     (host.currentSessionId ?? undefined) === sessionId &&
     visibleSessionMatches(host, sessionKey, agentId);
   if (operation?.pending) {
-    setChatError(host, t("chat.goals.actionPending"));
-    return false;
+    return rejectGoalOperation(host, t("chat.goals.actionPending"));
   }
-  if (operation?.retired) {
-    // Expired/invalid identities cannot be replayed. Refresh before letting the operator
-    // make a new decision; never transform a saved request into a fresh mutation.
-    if (action) {
-      return false;
-    }
+  const reconcileCurrentGoal = async (recoveryOperation: GoalOperation): Promise<boolean> => {
     const sessions = host.sessions;
     const connection = sessions.captureConnectionScope();
     const rowTarget = resolveUiConversationIdentity(host, sessionKey);
@@ -244,12 +351,12 @@ async function runGoalOperation(
       targetIsCurrent() &&
       host.sessions === sessions &&
       sessions.isConnectionScopeCurrent(connection) &&
-      goalOperationTarget(host)?.operation === operation;
-    const marker = JSON.stringify(operation.retired);
+      goalOperationTarget(host)?.operation === recoveryOperation;
     let observation: SessionRowObservation | undefined;
-    operation.pending = true;
-    host.requestUpdate?.();
     try {
+      if (!ownsRecovery()) {
+        return false;
+      }
       const outcome = await sessions.reconcileMutation(agentId);
       if (!ownsRecovery()) {
         return false;
@@ -263,10 +370,9 @@ async function runGoalOperation(
         { onInvalidate: () => {} },
       );
       const reconcile = observation.captureReconcile();
-      const described = await client.request<{ session?: GatewaySessionRow | null }>(
-        "sessions.describe",
+      const described = await sessions.describe(
         { key: sessionKey, ...(agentId ? { agentId } : {}) },
-        { timeoutMs: GOAL_REQUEST_TIMEOUT_MS },
+        { client, refresh: true, timeoutMs: GOAL_REQUEST_TIMEOUT_MS },
       );
       if (!ownsRecovery()) {
         return false;
@@ -294,6 +400,23 @@ async function runGoalOperation(
         }
         return false;
       }
+      return true;
+    } finally {
+      observation?.dispose();
+    }
+  };
+  if (operation?.retired) {
+    // Expired/invalid identities cannot be replayed. Refresh before letting the operator
+    // make a new decision; never transform a saved request into a fresh mutation.
+    if (action) {
+      return false;
+    }
+    const marker = JSON.stringify(operation.retired);
+    operations.setPending(operation, true);
+    try {
+      if (!(await reconcileCurrentGoal(operation))) {
+        return false;
+      }
       // A different consumer may already have retired this marker and saved a new intent.
       if (storage && storage.getItem(storageKey) !== marker) {
         return false;
@@ -308,9 +431,7 @@ async function runGoalOperation(
       }
       return false;
     } finally {
-      observation?.dispose();
-      operation.pending = false;
-      host.requestUpdate?.();
+      operations.setPending(operation, false);
     }
   }
   if (operation && action) {
@@ -322,18 +443,21 @@ async function runGoalOperation(
       (action.action === "edit" &&
         (!("objective" in params) || params.objective !== action.objective))
     ) {
-      setChatError(host, t("chat.goals.outcomeUnknown"));
-      return false;
+      return rejectGoalOperation(host, t("chat.goals.outcomeUnknown"));
     }
   }
   if (!operation) {
     if (!action) {
       return false;
     }
+    // A descriptor can expose Goal actions before history binds their recovery identity.
+    if (!sessionId || isInitialChatHistoryUnavailable(host)) {
+      return rejectGoalOperation(host, t("chat.thread.loading"));
+    }
     const identity = {
       sessionKey,
       ...(agentId ? { agentId } : {}),
-      ...(sessionId ? { sessionId } : {}),
+      sessionId,
       goalId: action.goalId,
       operationId: generateUUID(),
       issuedAtMs: Date.now(),
@@ -347,18 +471,19 @@ async function runGoalOperation(
             : { ...identity, action: action.action },
       pending: false,
     };
-    const schema =
-      action.action === "clear" ? SessionsGoalClearParamsSchema : SessionsGoalUpdateParamsSchema;
-    if (!Value.Check(schema, operation.params)) {
-      setChatError(host, t("chat.goals.invalidRequest"));
-      return false;
+    const validate =
+      action.action === "clear" ? isSessionsGoalClearParams : isSessionsGoalUpdateParams;
+    if (!validate(operation.params)) {
+      return rejectGoalOperation(host, t("chat.goals.invalidRequest"));
     }
     try {
       // Persist before sending: a storage failure must not start an unrecoverable Resume.
       storage?.setItem(storageKey, JSON.stringify(operation.params));
     } catch (error) {
-      setChatError(host, `${t("chat.goals.recoveryUnavailable")} ${formatUiError(error)}`);
-      return false;
+      return rejectGoalOperation(
+        host,
+        `${t("chat.goals.recoveryUnavailable")} ${formatUiError(error)}`,
+      );
     }
     operations.set(signature, operation);
   }
@@ -376,15 +501,48 @@ async function runGoalOperation(
       }
     }
   };
-  operation.pending = true;
+  operations.setPending(operation, true);
   setChatError(host, null);
-  host.requestUpdate?.();
   try {
-    const result = await client.request<SessionsGoalMutationResult>(
-      "action" in params ? "sessions.goal.update" : "sessions.goal.clear",
-      params,
-      { timeoutMs: GOAL_REQUEST_TIMEOUT_MS },
-    );
+    const request = () =>
+      client.request<SessionsGoalMutationResult>(
+        "action" in params ? "sessions.goal.update" : "sessions.goal.clear",
+        params,
+        { timeoutMs: GOAL_REQUEST_TIMEOUT_MS },
+      );
+    let result: SessionsGoalMutationResult;
+    try {
+      result = await request();
+    } catch (error) {
+      if (
+        !("action" in params && params.action === "resume") ||
+        !targetIsCurrent() ||
+        rejectedGoalReason(error) !== undefined ||
+        !(
+          error instanceof GatewayProtocolRequestTimeoutError ||
+          (error instanceof GatewayRequestError && error.code === "UNAVAILABLE")
+        )
+      ) {
+        throw error;
+      }
+      // Reconcile a lost ACK within this explicit Resume, preserving its durable identity.
+      // Rendering or restoring a saved request never starts this retry.
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 1_000);
+      });
+      if (
+        !targetIsCurrent() ||
+        goalOperationTarget(host)?.operation !== operation ||
+        goalOperationExpired(params.issuedAtMs)
+      ) {
+        throw error;
+      }
+      result = await request();
+    }
+    // Receipts describe the original decision. Keep recovery until the current goal is read.
+    if (result.replayed && !(await reconcileCurrentGoal(operation))) {
+      return false;
+    }
     operations.delete(signature);
     // The successful response already settled the operation, even if storage cleanup fails.
     try {
@@ -394,28 +552,29 @@ async function runGoalOperation(
     }
     if (targetIsCurrent()) {
       if (result.replayed) {
-        // Receipt snapshots describe the original decision, not the current goal or run.
-        void refreshChatSessionListForTarget(host, { sessionKey, agentId }).catch(
-          (error: unknown) => {
-            if (targetIsCurrent()) {
-              setChatError(host, formatUiError(error));
-              host.requestUpdate?.();
-            }
-          },
-        );
         return true;
       }
-      const row = host.sessions.state.result?.sessions.find((entry) =>
-        areUiSessionKeysEquivalent(entry.key, sessionKey),
+      const row = host.sessionsResult?.sessions.find(
+        (entry) =>
+          areUiSessionKeysEquivalent(entry.key, sessionKey) &&
+          entry.sessionId === sessionId &&
+          (entry.agentId === undefined || entry.agentId === rowAgentId),
       );
       // A newer event or a replacement goal wins over a delayed mutation response.
       if (
         row?.goal?.id === params.goalId &&
         (!result.goal || result.goal.updatedAt >= row.goal.updatedAt)
       ) {
-        host.sessions.patchRowLocal(row.key, { goal: result.goal });
+        if (rowAgentId && sessionId) {
+          host.sessions.patchRowLocal(
+            row.key,
+            { goal: result.goal },
+            { agentId: rowAgentId, sessionId },
+          );
+        }
         if (result.status === "started" && result.runId) {
           adoptStartedChatRun(host, result.runId, Date.now());
+          operations.recordStartedExecution(params.goalId, result.runId, targetIsCurrent);
         }
       }
     }
@@ -423,20 +582,13 @@ async function runGoalOperation(
   } catch (error) {
     // UNAVAILABLE can follow a commit. A definitive rejection may retire the intent,
     // but receipt expiry still requires observing the current Goal before a new decision.
-    const details =
-      error instanceof GatewayRequestError && isRecord(error.details) ? error.details : null;
-    const reason = details?.reason;
-    const rejected =
-      typeof reason === "string" &&
-      ((details?.code === "GOAL_OPERATION_REJECTED" && rejectedGoalReasons.has(reason)) ||
-        // Resume can be rejected by chat pre-admission before a turn is reserved.
-        (reason.startsWith("goal-") && rejectedGoalReasons.has(reason.slice(5))));
+    const reason = rejectedGoalReason(error);
+    const rejected = reason !== undefined;
     if (rejected) {
       const retired = reason === "expired" || reason === "goal-expired" ? "expired" : undefined;
       if (retired) {
         // The server's receipt clock wins: expiry cannot prove the original outcome.
-        operation.params = undefined;
-        operation.retired = retired;
+        operations.expire(operation);
       } else {
         operations.delete(signature);
       }
@@ -447,11 +599,15 @@ async function runGoalOperation(
       }
     }
     if (targetIsCurrent()) {
-      setChatError(host, rejected ? formatUiError(error) : null);
+      setChatError(
+        host,
+        rejected
+          ? formatUiError(error)
+          : `${t("chat.goals.outcomeUnknown")} ${formatUiError(error)}`,
+      );
     }
     return false;
   } finally {
-    operation.pending = false;
-    host.requestUpdate?.();
+    operations.setPending(operation, false);
   }
 }
