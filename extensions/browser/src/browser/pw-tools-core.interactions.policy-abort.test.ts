@@ -9,7 +9,8 @@ import {
   setPwToolsCoreCurrentRefLocator,
 } from "./pw-tools-core.test-harness.js";
 
-const interactions = await import("./pw-tools-core.interactions.js");
+// Load after the test harness registers the session module mocks.
+const interactions = await import("./pw-tools-core.interactions.actions.js");
 
 type NavigationGuardCall = {
   action: (url: string) => Promise<unknown>;

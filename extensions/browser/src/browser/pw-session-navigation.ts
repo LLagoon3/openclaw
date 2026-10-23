@@ -296,7 +296,6 @@ export async function withPageNavigationRequestGuard<T>(
         await stopGuardedRoute(route, true, err);
         return;
       }
-
     }
     try {
       await resumeRouteSafely(route, "fallback");
